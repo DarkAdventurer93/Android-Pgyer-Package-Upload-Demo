@@ -1,0 +1,494 @@
+import groovy.json.JsonSlurper
+
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.nio.charset.StandardCharsets
+import java.nio.file.Files
+import java.util.concurrent.TimeUnit
+import java.util.function.BiConsumer
+
+class Pyger {
+    String version //当前版本
+    String flavors = ""//flavorsName，一般修改为自己的
+    boolean isRelease//是否正式包，若为正式包，则强制用release模式打包，环境配置强制为正式配置，见PackagePgyerUploadPlugin#apply方法
+    int tag //见{@link uploadApk}中的apiInfoMap
+    String webhookUrl = ""
+    // 企业微信webhook地址，用于打包完成之后发到群里通知测试
+    boolean webhookEnabled = true //是否开启通知
+    String environment //打包的环境，用于查看日志是否打错包
+    String mentionedList = "" //webhook到企业微信群里的时候@的人，多人时用,分割开
+
+    @Override
+    String toString() {
+        def str = ">>>> 脚本打包配置信息:\nversion:$version \nflavors:$flavors  \nisRelease:$isRelease  \ntag:$tag \nenvironment:$environment \nwebhookUrl:$webhookUrl \nwebHookEnabled:$webhookEnabled \nmentionedList:$mentionedList"
+        return str
+    }
+}
+
+tasks.withType(JavaCompile) {
+    options.encoding = "UTF-8"
+}
+
+class PackagePgyerUploadPlugin implements Plugin<Project> {
+    String uploadTaskName = "packagePgyerUpload"
+
+    @Override
+    void apply(Project project) {
+        //添加app的build.gradle中定义的Pyger对象，用于存放一些打包配置信息
+        project.extensions.add("pgyer", Pyger)
+        project.afterEvaluate {
+            // 取得外部参数
+            Pyger bean = project.pgyer
+            def str = bean.flavors
+            def isRelease = bean.isRelease
+            String buildType
+            //如果是release模式打包，则强制打正式包，环境用正式
+            if (isRelease) {
+                buildType = "Release"
+                bean.environment = "pro"
+            } else {
+                buildType = "Debug"
+            }
+            println bean
+            //打印BuildConfigField中定义的字段
+            printBuildConfigFields(project, buildType)
+            //自定义的逻辑，因为我们的正式包一般只会打在tag=1上，加这句是为了提示开发人员看是否真的打错地址了
+            if (isRelease && bean.tag != 1) {
+                println(">>>> 警告：isRelease=true时tag=" + bean.tag + "，请检查tag是否错误！")
+            }
+            //创建task
+            project.tasks.create(uploadTaskName) {
+                doLast {
+                    uploadApk(project.getProjectDir().getAbsolutePath(), str, buildType, bean.tag, bean.version, bean.webhookUrl, bean.webhookEnabled, bean.mentionedList)
+                    //再次打印看环境配置是否错误，用于确认看打的包连的是测试环境还是正式环境
+                    String[] env = ['SERVER_URL', 'SERVER_PAYMENT_URL']
+                    printBuildConfigFields(project, buildType, env)
+                }
+            }.dependsOn("assemble$str$buildType")
+
+        }
+    }
+
+    def printBuildConfigFields(Project project, String buildType) {
+        printBuildConfigFields(project, buildType, null)
+    }
+
+    def printBuildConfigFields(Project project, String buildType, String[] fieldsToPrint) {
+        project.extensions.android.getBuildTypes().findByName(buildType.toLowerCase()).getBuildConfigFields().forEach(new BiConsumer<String, Object>() {
+            @Override
+            void accept(String s, Object classField) {
+                if (fieldsToPrint == null || fieldsToPrint.length == 0) {
+                    println ">>>> " + s.toLowerCase() + ":" + classField.value
+                } else {
+                    for (i in 0..<fieldsToPrint.length) {
+                        if (s == fieldsToPrint[i]) {
+                            println ">>>> " + s.toLowerCase() + ":" + classField.value
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    /*
+    * 上传apk方法
+    * */
+
+    static def uploadApk(String rootPath, String dirname, String buildType, int tag, String version, String webhookUrl, boolean webHookEnabled, String mentionedList) {
+        //查找上传的apk文件  task打包在build文件夹下
+        def apkDir = new File("$rootPath\\build\\outputs\\apk\\" + dirname + "\\" + buildType)
+        if (!apkDir.exists()) {
+            throw new RuntimeException("apk output path not exists!")
+        }
+
+        def apk = null
+
+        for (int i = apkDir.listFiles().length - 1; i >= 0; i--) {
+            File file = apkDir.listFiles()[i]
+            //遍历文件夹，找到包含版本号的apk文件
+            if (file.name.endsWith(".apk") && file.name.contains(version)) {
+                if (apk == null) {
+                    apk = file
+                } else {
+                    //若有多个符合条件的apk文件，则取最新的
+                    if (apk.lastModified() < file.lastModified()) {
+                        apk = file
+                    }
+                }
+            }
+        }
+        if (apk == null) {
+            throw new RuntimeException("apk file not exists!")
+        }
+
+        println(">>>> 本地apk路径:$apkDir\\$apk.name")
+        println ">>>> 准备上传apk文件 <<<<"
+
+        //蒲公英快速上传app，api信息及密码
+        HashMap<Integer, ApiInfo> apiInfoMap = new ArrayList<>()
+        //正式环境
+        apiInfoMap.put(1, new ApiInfo("你的apikey"))
+        //测试环境
+        apiInfoMap.put(2, new ApiInfo("你的apikey"))
+        ApiInfo apiInfo = apiInfoMap.get(tag)
+        if (apiInfo == null) {
+            println(">>>> tag:$tag 未匹配到蒲公英api信息，请检查配置！")
+            return
+        }
+        //读取本次更新日志
+        def releaseNoteFile = new File("$rootPath\\src\\main\\assets\\releaseNote.txt")
+        String releaseNote = readReleaseNote(releaseNoteFile)
+        //获取蒲公英的apiKey信息和配置的下载密码
+        def apikey = apiInfo.apiKey
+        def password = apiInfo.password
+        //组装cosToken需要的的参数，见https://www.pgyer.com/doc/view/api#fastUploadApp
+        List<KeyValue> cosTokenParams = new ArrayList<>()
+        //API KEY
+        cosTokenParams.add(new KeyValue("_api_key", apikey))
+        //属于android平台
+        cosTokenParams.add(new KeyValue("buildType", "android"))
+        //更新描述，tag对应打包的账号，每个账号一般只对应一个环境，tag放在更新描述好处是可以在忘记的时候查看更新描述来回忆这个包是什么环境的
+        StringBuilder buildUpdateDescription = new StringBuilder("tag = ")
+        buildUpdateDescription.append(tag)
+        if (releaseNote != null && releaseNote.length() > 0) {
+            buildUpdateDescription.append('\n').append(releaseNote)
+        }
+        cosTokenParams.add(new KeyValue("buildUpdateDescription", buildUpdateDescription.toString()))
+        //安装类型，2为密码安装
+        cosTokenParams.add(new KeyValue("buildInstallType", "2"))
+        //安装密码
+        cosTokenParams.add(new KeyValue("buildPassword", password))
+        //1、获取上传的 token，见https://www.pgyer.com/doc/view/api#fastUploadApp
+        HttpResponse<String> response = postFormData("https://www.pgyer.com/apiv2/app/getCOSToken", cosTokenParams)
+        def resp = new JsonSlurper().parseText(response.body())
+
+        //2、上传文件到第上一步获取的 URL，参数从上一步获取，这里需要解析参数
+        String paramsString = String.valueOf(resp.data.params)
+        String[] params = paramsString.substring(1, paramsString.length() - 1).split(',')
+        List<KeyValue> list = new ArrayList<>()
+        if (params != null) {
+            for (i in 0..<params.length) {
+                String rawParam = params[i].trim()
+                String parsedKey = rawParam.substring(0, rawParam.indexOf("="))
+                String parsedValue = rawParam.substring(rawParam.indexOf("=") + 1, rawParam.length())
+                //添加参数
+                list.add(new KeyValue(parsedKey, parsedValue))
+            }
+        }
+        //添加apk文件
+        list.add(new KeyValue("file", apk.getPath(), true))
+        HttpResponse<String> uploadResponse = postFormData(resp.data.endpoint, list)
+        if (uploadResponse.statusCode() == 204) {
+            println(">>>> 上传apk成功")
+        } else {
+            println(">>>> 上传apk失败" + uploadResponse.body())
+            return
+        }
+
+        //3.查询是否发布完成
+        int currentQueryCount = 0
+        int retryCount = 20
+        while (retryCount > 0) {
+            try {
+                retryCount--
+                Thread.sleep(4 * 1000L)
+                currentQueryCount++
+                queryAppPublishStatus(apikey, resp.data.key, currentQueryCount, new AppPublishStatusCallback() {
+                    @Override
+                    void onAppPublished(def queryResp) {
+                        retryCount = 0
+                        //清除本次更新日志
+                        clearReleaseNoteIfNeeded(releaseNoteFile)
+                        //完整的下载链接
+                        String fullAppDetailsUrl = "https://www.pgyer.com/" + queryResp.data.buildShortcutUrl
+                        println(">>>> 下载地址:\n$fullAppDetailsUrl\n$password")
+                        if (!webHookEnabled) {
+                            println ">>>> Webhook未打开"
+                            return
+                        }
+                        //发送通知
+                        notify(webhookUrl, queryResp, releaseNote, fullAppDetailsUrl, password, mentionedList)
+                    }
+
+                    @Override
+                    void onPublishError() {
+                        retryCount = 0
+                    }
+
+                    @Override
+                    void onPublishing() {
+                    }
+                })
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+                // Restore interrupted state...
+                Thread.currentThread().interrupt();
+
+            }
+        }
+    }
+
+    /*
+    * 企业微信发送通知，若想改成钉钉或者其他可以自行按照需求修改，下面的代码中默认会@开发者，可以自行修改去掉
+    * */
+
+    static def notify(String webhookUrl, def resp, String releaseNote, String url, String password, String mentionedList) {
+        if (webhookUrl == null || webhookUrl.length() == 0) {
+            println(">>>> webhookUrl未配置，请在app/build.gradle下的pyger中配置webhookUrl!")
+            return
+        }
+        def apkSize = new BigDecimal((Integer.parseInt(resp.data.buildFileSize)) / 1024 / 1024).setScale(1, BigDecimal.ROUND_HALF_UP).floatValue() + " MB";
+
+        String content = "软件更新提醒 \n" +
+                "您的应用上传了新版本 \n" +
+                "应用名称：" + resp.data.buildName + "\n" +
+                "版本信息：" + resp.data.buildVersion + " (Build " + resp.data.buildBuildVersion + ")" + "\n" +
+                "应用大小：" + apkSize + "\n" +
+                "更新时间：" + resp.data.buildUpdated + "\n"
+
+        if (releaseNote != null && releaseNote.length() > 0) {
+            content += "更新内容：" + releaseNote + "\n";
+        }
+
+        content += "扫码下载：" + resp.data.buildQRCodeURL + "\n" +
+                "点击查看应用:\n" + url + "\n" + password
+
+        //企业微信通知的人
+        String[] mentionedArray = null
+        if (mentionedList != null && !mentionedList.isEmpty()) {
+            mentionedArray = mentionedList.trim().split(",")
+        }
+        def mentionSb = new StringBuilder('[')
+        //默认会@开发者
+        def developer = "1111111111"
+        mentionSb.append(developer)
+        if (mentionedArray == null) {
+            mentionSb.append(']')
+        } else {
+            mentionSb.append(',')
+            for (i in 0..<mentionedArray.length) {
+                def phone = mentionedArray[i].trim()
+                if (developer != phone) {
+                    mentionSb.append(phone)
+                }
+                if (i != mentionedArray.length - 1) {
+                    mentionSb.append(',')
+                }
+            }
+            mentionSb.append(']')
+        }
+        mentionSb.append(',')
+        def sbNotification = new StringBuilder()
+        sbNotification.append("{" +
+                "\"msgtype\": \"text\",\n" +
+                "\"text\": {\n" +
+                "\"content\":" + "\"" + content + "\"" + ",\n" +
+                "\"mentioned_mobile_list\":" + mentionSb.toString() +
+                "\n}" +
+                "\n}")
+
+        postJson(webhookUrl, sbNotification.toString())
+    }
+
+    static def clearReleaseNoteIfNeeded(File releaseNoteFile) {
+        if (releaseNoteFile.exists()) {
+            def fw = null
+            try {
+                fw = new FileWriter(releaseNoteFile);
+                fw.write("")
+            } catch (IOException e) {
+                e.printStackTrace()
+            } finally {
+                close(fw)
+            }
+        }
+    }
+
+    static def close(Closeable closeable) {
+        try {
+            if (closeable != null) {
+                closeable.close()
+            }
+        } catch (Exception e) {
+            e.printStackTrace()
+        }
+    }
+
+    static String readReleaseNote(File releaseNoteFile) {
+        String releaseNote = "";
+        if (releaseNoteFile.exists()) {
+            ByteArrayOutputStream os = null
+            FileInputStream is = new FileInputStream(releaseNoteFile);
+            try {
+                os = new ByteArrayOutputStream();
+                byte[] b = new byte[8192];
+                int fileLen;
+                while ((fileLen = is.read(b, 0, 8192)) != -1) {
+                    os.write(b, 0, fileLen);
+                }
+                releaseNote = new String(os.toByteArray());
+            } catch (IOException e) {
+                println(e.getMessage());
+            } finally {
+                close(is)
+                close(os)
+            }
+            if (releaseNote.length() == 0) {
+                println ">>>> 本次发布未填写更新说明，如需增加，请在assets下的releaseNote.txt中增加说明 <<<<"
+            }
+        } else {
+            println ">>>> 没有找到更新说明文件, 如需增加更新说明，请在assets文件夹下新建releaseNote.txt <<<<"
+        }
+        return releaseNote
+    }
+
+    /*
+    * 查询应用发布状态
+    * */
+
+    static void queryAppPublishStatus(String apikey, String buildKey, int currentQueryCount, AppPublishStatusCallback onAppPublishCallback) {
+        List<KeyValue> queryParams = new ArrayList<>()
+        queryParams.add(new KeyValue("_api_key", apikey))
+        queryParams.add(new KeyValue("buildKey", buildKey))
+        def queryResp = new JsonSlurper().parseText(postFormData("https://www.pgyer.com/apiv2/app/buildInfo", queryParams).body())
+        String msgPrefix = "[第" + currentQueryCount + "次查询]"
+        if (queryResp.code == 1216 || queryResp.code == 1249) {
+            println(">>>> $msgPrefix 应用发布失败！message:" + queryResp.message)
+            onAppPublishCallback.onPublishError()
+            return
+        }
+        if (queryResp.code == 1246 || queryResp.code == 1247) {
+            println(">>>> $msgPrefix 应用正在发布中:" + queryResp.message)
+            onAppPublishCallback.onPublishing()
+            return
+        }
+        println(">>>> $msgPrefix 应用发布成功！")
+        onAppPublishCallback.onAppPublished(queryResp)
+    }
+
+    static interface AppPublishStatusCallback {
+        void onAppPublished(def response)
+
+        void onPublishError()
+
+        void onPublishing()
+    }
+
+    static HttpResponse<String> postJson(String url, String json) {
+        long requestStartTime = System.nanoTime()
+        println(">>>> Send json body request, Uri = " + url)
+        println(">>>> Params:\n" + json)
+        // add json header
+        HttpRequest request = HttpRequest.newBuilder()
+                .POST(HttpRequest.BodyPublishers.ofString(json))
+                .uri(URI.create(url))
+                .header("Content-Type", "application/json")
+                .build();
+        HttpResponse<String> resp = HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString())
+        long requestEndTime = System.nanoTime()
+        long elapsedTime = TimeUnit.NANOSECONDS.toMillis(requestEndTime - requestStartTime);
+        println(">>>> Uri:$url cost $elapsedTime ms")
+        println("<<<< End request")
+        println(">>>> StatusCode:" + resp.statusCode())
+        println(">>>> ResponseBody:")
+        String body = resp.body()
+        if (body != null && body.length() > 0) {
+            println(body)
+        }
+        return resp
+    }
+
+    static HttpResponse<String> postFormData(String url, List<KeyValue> list) {
+        long requestStartTime = System.nanoTime()
+        println(">>>> Send formData request, Uri = " + url)
+        println(">>>> Params:\n" + list)
+        String boundary = "*********"
+        // Result request body
+        List<byte[]> byteArrays = new ArrayList<>()
+        // Separator with boundary
+        byte[] separator = ("--" + boundary + "\r\nContent-Disposition: form-data; name=").getBytes(StandardCharsets.UTF_8)
+        // Iterating over data parts
+        for (i in 0..<list.size()) {
+            // Opening boundary
+            byteArrays.add(separator)
+            def entry = list[i]
+            // If value is type of Path (file) append content type with file name and file binaries, otherwise simply append key=value
+            if (entry.isFile) {
+                java.nio.file.Path path = new File(entry.getValue()).toPath()
+                String mimeType = Files.probeContentType(path)
+                byteArrays.add(("\"" + entry.getKey() + "\"; filename=\"" + path.getFileName()
+                        + "\"\r\nContent-Type: " + mimeType + "\r\n\r\n").getBytes(StandardCharsets.UTF_8))
+                byteArrays.add(Files.readAllBytes(path))
+                byteArrays.add("\r\n".getBytes(StandardCharsets.UTF_8))
+            } else {
+                byteArrays.add(("\"" + entry.getKey() + "\"\r\n\r\n" + entry.getValue() + "\r\n")
+                        .getBytes(StandardCharsets.UTF_8))
+            }
+        }
+        // Closing boundary
+        byteArrays.add(("--" + boundary + "--").getBytes(StandardCharsets.UTF_8))
+        // Serializing as byte array
+        def publisher = HttpRequest.BodyPublishers.ofByteArrays(byteArrays)
+        HttpRequest httpRequest = HttpRequest
+                .newBuilder(URI.create(url))
+                .header("Content-Type", "multipart/form-data;boundary=" + boundary)
+                .POST(publisher)
+                .build()
+        HttpResponse<String> resp = HttpClient.newHttpClient().send(httpRequest, HttpResponse.BodyHandlers.ofString())
+        long requestEndTime = System.nanoTime()
+        long elapsedTime = TimeUnit.NANOSECONDS.toMillis(requestEndTime - requestStartTime);
+        println(">>>> Uri:$url cost $elapsedTime ms")
+        println("<<<< End request")
+        println(">>>> StatusCode:" + resp.statusCode())
+        println(">>>> ResponseBody:")
+        String body = resp.body()
+        if (body != null && body.length() > 0) {
+            println(body)
+        }
+        return resp
+    }
+
+    static class KeyValue {
+        String key
+        String value
+        boolean isFile
+
+        KeyValue(String key, String value) {
+            this(key, value, false)
+        }
+
+        KeyValue(String key, String value, boolean isFile) {
+            this.key = key
+            this.value = value
+            this.isFile = isFile
+        }
+
+        @Override
+        String toString() {
+            return "{key:" + key + ", value:" + value + ", isFile:$isFile}"
+        }
+    }
+
+    static class ApiInfo {
+        String apiKey
+        String password = "Yin=2018"
+
+        ApiInfo(String apiKey) {
+            this(apiKey, "Yin=2018")
+        }
+
+        ApiInfo(String apiKey, String password) {
+            this.apiKey = apiKey
+            this.password = password
+        }
+
+        @Override
+        String toString() {
+            return "apiKey:$apiKey, password:$password"
+        }
+    }
+
+}
+
+apply plugin: PackagePgyerUploadPlugin

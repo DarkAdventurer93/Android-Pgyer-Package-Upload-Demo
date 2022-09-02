@@ -1,0 +1,26 @@
+// Top-level build file where you can add configuration options common to all sub-projects/modules.
+/*引入app版本配置文件*/
+apply from: "versions.gradle"
+buildscript {
+    /*应用配置gradle*/
+    apply from: "config.gradle"
+    def plugins = rootProject.ext.plugins
+    //添加仓库信息
+    rootProject.ext.addRepos(repositories)
+    dependencies {
+        //应用config.gradle中的plugins，方便统一管理
+        classpath plugins["android.tools.build"]
+        classpath plugins["kotlin.plugin"]
+        // NOTE: Do not place your application dependencies here; they belong
+        // in the individual module build.gradle files
+    }
+}
+
+allprojects {
+    //添加仓库信息
+    rootProject.ext.addRepos(repositories)
+}
+
+task clean(type: Delete) {
+    delete rootProject.buildDir
+}
